@@ -28,6 +28,37 @@ import utils
 import vision_transformer as vits
 
 
+def frozen_features(arch, model, inp, n, avgpool):
+    with torch.no_grad():
+        if "vit" in arch:
+            intermediate_output = model.get_intermediate_layers(inp, n)
+            output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+            if avgpool:
+                output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                output = output.reshape(output.shape[0], -1)
+        else:
+            output = model(inp)
+    return output
+
+
+@torch.no_grad()
+def extract_features(arch, model, loader, n, avgpool, output_dir, name=''):
+    filepath = os.path.join(output_dir, f'{arch}_{name}.pth')
+    if os.path.exists(filepath):
+        features = torch.load(filepath)
+        return features
+    features = []
+    header = f'{name} feature extraction: '
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    for (inp, target) in metric_logger.log_every(loader, 20, header):
+        # move to gpu
+        inp = inp.cuda(non_blocking=True)
+        # forward
+        output = frozen_features(arch, model, inp, n, avgpool)
+        features.append([output.cpu(), target])
+    torch.save(features, filepath)
+    return features
+
 def eval_linear(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -81,13 +112,15 @@ def eval_linear(args):
         test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
-
-    train_transform = pth_transforms.Compose([
-        pth_transforms.RandomResizedCrop(224),
-        pth_transforms.RandomHorizontalFlip(),
-        pth_transforms.ToTensor(),
-        pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ])
+    if args.no_aug:
+        train_transform = val_transform
+    else:
+        train_transform = pth_transforms.Compose([
+            pth_transforms.RandomResizedCrop(224),
+            pth_transforms.RandomHorizontalFlip(),
+            pth_transforms.ToTensor(),
+            pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ])
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
@@ -98,6 +131,14 @@ def eval_linear(args):
         pin_memory=True,
     )
     print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
+
+    # extract features if --no_aug
+    if args.no_aug:
+        train_features = extract_features(args.arch, model, train_loader, args.n_last_blocks, args.avgpool_patchtokens, args.output_dir, 'train')
+        train_loader   = train_features
+        val_features = extract_features(args.arch, model, val_loader, args.n_last_blocks, args.avgpool_patchtokens, args.output_dir, 'val')
+        val_loader   = val_features
+        print("Features are ready!\nStarting to train the linear classifier.")
 
     # set optimizer
     optimizer = torch.optim.SGD(
@@ -121,15 +162,15 @@ def eval_linear(args):
     best_acc = to_restore["best_acc"]
 
     for epoch in range(start_epoch, args.epochs):
-        train_loader.sampler.set_epoch(epoch)
+        if not args.no_aug: train_loader.sampler.set_epoch(epoch)
 
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
+        train_stats = train(args.no_aug, args.arch, model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
         scheduler.step()
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
+            test_stats = validate_network(args.no_aug, args.arch, val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
@@ -150,7 +191,7 @@ def eval_linear(args):
                 "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
+def train(has_frozen, arch, model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -161,16 +202,11 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
         target = target.cuda(non_blocking=True)
 
         # forward
-        with torch.no_grad():
-            if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
-            else:
-                output = model(inp)
-        output = linear_classifier(output)
+        if has_frozen:
+            output = linear_classifier(inp)
+        else:
+            output = frozen_features(arch, model, inp, n, avgpool)
+            output = linear_classifier(output)
 
         # compute cross entropy loss
         loss = nn.CrossEntropyLoss()(output, target)
@@ -193,7 +229,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
 
 
 @torch.no_grad()
-def validate_network(val_loader, model, linear_classifier, n, avgpool):
+def validate_network(has_frozen, arch, val_loader, model, linear_classifier, n, avgpool):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -203,16 +239,11 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         target = target.cuda(non_blocking=True)
 
         # forward
-        with torch.no_grad():
-            if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
-            else:
-                output = model(inp)
-        output = linear_classifier(output)
+        if has_frozen:
+            output = linear_classifier(inp)
+        else:
+            output = frozen_features(arch, model, inp, n, avgpool)
+            output = linear_classifier(output)
         loss = nn.CrossEntropyLoss()(output, target)
 
         if linear_classifier.module.num_labels >= 5:
@@ -277,5 +308,6 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
     parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+    parser.add_argument('--no_aug', action='store_true', help='no augmentation when training the classifier')
     args = parser.parse_args()
     eval_linear(args)
